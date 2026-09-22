@@ -6,25 +6,26 @@ export async function onRequest(context) {
     return new Response("Missing url parameter", { status: 400 });
   }
 
+  // Standardized CORS headers
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+  };
+
   // Handle CORS preflight requests
   if (context.request.method === "OPTIONS") {
-    return new Response(null, {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-      },
-    });
+    return new Response(null, { headers: corsHeaders });
   }
 
   // Set the specific User-Agent required by the SonyLIV streams (from the .m3u file)
-  const headers = new Headers();
-  headers.set("User-Agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
+  const fetchHeaders = new Headers();
+  fetchHeaders.set("User-Agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
 
   try {
     const response = await fetch(target, {
       method: context.request.method,
-      headers: headers,
+      headers: fetchHeaders,
       redirect: "follow"
     });
 
@@ -69,33 +70,48 @@ export async function onRequest(context) {
         return line;
       });
       
-      const newResponse = new Response(rewrittenLines.join('\n'), {
-        status: response.status,
-        statusText: response.statusText
-      });
-      
-      // Copy over headers and add CORS
+      // Create new headers cleanly
+      const newHeaders = new Headers();
       for (const [key, value] of response.headers.entries()) {
         const lowerKey = key.toLowerCase();
-        // Do not copy content-encoding or content-length because we rewrote the body!
-        if (lowerKey === 'content-encoding' || lowerKey === 'content-length') {
+        // Skip content encoding/length because body is rewritten, skip existing CORS to avoid duplicates
+        if (lowerKey === 'content-encoding' || lowerKey === 'content-length' || lowerKey.startsWith('access-control-')) {
           continue;
         }
-        newResponse.headers.set(key, value);
+        newHeaders.set(key, value);
       }
-      newResponse.headers.set("Access-Control-Allow-Origin", "*");
-      return newResponse;
+      
+      // Apply our clean CORS headers
+      Object.entries(corsHeaders).forEach(([k, v]) => newHeaders.set(k, v));
+
+      return new Response(rewrittenLines.join('\n'), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: newHeaders
+      });
     }
 
     // For other files (e.g. .ts segments), stream them through directly
-    const proxyResponse = new Response(response.body, response);
-    proxyResponse.headers.set("Access-Control-Allow-Origin", "*");
-    return proxyResponse;
+    const proxyHeaders = new Headers(response.headers);
+    
+    // Strip existing upstream CORS headers to avoid "*, *" duplicate origin errors
+    proxyHeaders.delete("Access-Control-Allow-Origin");
+    proxyHeaders.delete("Access-Control-Allow-Methods");
+    proxyHeaders.delete("Access-Control-Allow-Headers");
+    
+    // Apply our clean CORS headers
+    Object.entries(corsHeaders).forEach(([k, v]) => proxyHeaders.set(k, v));
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: proxyHeaders
+    });
 
   } catch (e) {
     return new Response("Error fetching stream: " + e.message, { 
       status: 500,
-      headers: { "Access-Control-Allow-Origin": "*" }
+      headers: corsHeaders
     });
   }
-}
+        }
