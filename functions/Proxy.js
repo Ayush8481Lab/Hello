@@ -14,10 +14,7 @@ export async function onRequest(context) {
     return new Response("Invalid url parameter passed.", { status: 400 });
   }
 
-  // CORE FIX: Forward ALL extra query parameters to the target URL.
-  // If the stream URL had unencoded '&hmac=...' params, or if the video player 
-  // automatically appended tokens to our proxy URL, this loop catches them 
-  // and injects them back into the CDN request where they belong!
+  // Forward ALL extra query parameters to the target URL (handles separated HMACs/Tokens)
   requestUrl.searchParams.forEach((value, key) => {
     if (key !== "url") {
       targetUrlObj.searchParams.set(key, value);
@@ -33,14 +30,13 @@ export async function onRequest(context) {
     "Access-Control-Allow-Headers": "*",
   };
 
-  // Handle preflight
+  // Handle preflight requests
   if (context.request.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
   // 3. Set standard Bypass Headers
   const fetchHeaders = new Headers();
-  // Standard User-Agent to bypass blocks, plus the specific ExoPlayer one you requested
   fetchHeaders.set("User-Agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
   fetchHeaders.set("Accept", "*/*");
 
@@ -60,7 +56,7 @@ export async function onRequest(context) {
       const text = await response.text();
       const lines = text.split("\n");
 
-      // Dynamically detect the current worker path so you don't have to hardcode /proxy
+      // Dynamically detect the current worker path
       const proxyBase = requestUrl.origin + requestUrl.pathname + "?url=";
 
       const rewrittenLines = lines.map((line) => {
@@ -100,12 +96,16 @@ export async function onRequest(context) {
         if (
           lowerKey === "content-encoding" ||
           lowerKey === "content-length" ||
+          lowerKey === "content-type" || // <-- STRIP THE ORIGINAL CONTENT-TYPE
           lowerKey.startsWith("access-control-")
         ) {
           continue;
         }
         newHeaders.set(key, value);
       }
+
+      // FIX: Force the correct HLS Content-Type so it never renders as raw text!
+      newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
 
       // Inject strict CORS
       Object.entries(corsHeaders).forEach(([k, v]) => newHeaders.set(k, v));
@@ -137,4 +137,4 @@ export async function onRequest(context) {
       headers: corsHeaders,
     });
   }
-                                       }
+}
