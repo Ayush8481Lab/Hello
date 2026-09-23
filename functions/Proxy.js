@@ -106,19 +106,29 @@ export async function onRequest(context) {
     }
 
     // --- PERFECT DASH/MP4 PASSTHROUGH ---
-    // For DASH (.mpd), .m4s, .mp4 files: We do NOT rewrite. We stream them through directly.
-    // This provides the exact original format/headers and lets Tivimate handle the chunks natively.
-    const proxyResponse = new Response(response.body, response);
+    // We recreate the headers safely so we can modify them
+    const proxyHeaders = new Headers(response.headers);
     
     // Strip upstream CORS headers to prevent duplicate "*, *" errors
-    proxyResponse.headers.delete("Access-Control-Allow-Origin");
-    proxyResponse.headers.delete("Access-Control-Allow-Methods");
-    proxyResponse.headers.delete("Access-Control-Allow-Headers");
+    proxyHeaders.delete("Access-Control-Allow-Origin");
+    proxyHeaders.delete("Access-Control-Allow-Methods");
+    proxyHeaders.delete("Access-Control-Allow-Headers");
+    
+    // FIX: If the file is an MPD manifest, force the correct DASH XML Content-Type!
+    // This stops the browser from showing raw XML text.
+    if (finalTargetUrl.includes(".mpd") || contentType.includes("dash+xml")) {
+      proxyHeaders.set("Content-Type", "application/dash+xml");
+    }
     
     // Set our clean CORS headers
-    proxyResponse.headers.set("Access-Control-Allow-Origin", "*");
+    proxyHeaders.set("Access-Control-Allow-Origin", "*");
     
-    return proxyResponse;
+    // We pass `response.body` completely untouched so DRM chunks work natively!
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: proxyHeaders
+    });
 
   } catch (e) {
     return new Response("Error fetching stream: " + e.message, { 
