@@ -6,7 +6,7 @@ export async function onRequest(context) {
     return new Response("Missing url parameter", { status: 400 });
   }
 
-  // RECONSTRUCT TARGET URL PERFECTLY: 
+  // 1. RECONSTRUCT TARGET URL PERFECTLY
   let targetUrlObj;
   try {
     targetUrlObj = new URL(targetParam);
@@ -14,7 +14,7 @@ export async function onRequest(context) {
     return new Response("Invalid url parameter passed.", { status: 400 });
   }
 
-  // Ensure any tokens (&hmac=, &hdntl=) passed to the proxy are correctly merged
+  // Capture all DRM tokens attached to the proxy request
   url.searchParams.forEach((value, key) => {
     if (key !== "url") {
       targetUrlObj.searchParams.set(key, value);
@@ -23,22 +23,21 @@ export async function onRequest(context) {
 
   const finalTargetUrl = targetUrlObj.href;
 
-  // Handle CORS preflight requests
+  // 2. Handle CORS preflight requests
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+  };
+
   if (context.request.method === "OPTIONS") {
-    return new Response(null, {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-      },
-    });
+    return new Response(null, { headers: corsHeaders });
   }
 
-  // Set the specific User-Agent required by the streams
+  // 3. Set standard Bypass Headers
   const headers = new Headers();
   headers.set("User-Agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
   
-  // Pass essential headers
   const clientHeaders = context.request.headers;
   ["range", "accept", "cookie", "authorization"].forEach(h => {
     if (clientHeaders.has(h)) headers.set(h, clientHeaders.get(h));
@@ -53,25 +52,20 @@ export async function onRequest(context) {
 
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
     const finalUrl = response.url || finalTargetUrl;
-    
+
     const isM3u8 = finalTargetUrl.includes(".m3u8") || contentType.includes("mpegurl");
     const isMpd = finalTargetUrl.includes(".mpd") || contentType.includes("dash+xml");
 
-    // Dynamic routing: Manifests hit the current proxy, Segments hit your new Segmentsproxy
     const manifestProxyBase = url.origin + url.pathname + '?url=';
     const segmentProxyBase = url.origin + '/Segmentsproxy?url=';
 
-    // HELPER: Safely resolves relative paths and forces DRM token inheritance!
+    // Helper: Safely resolves relative paths and forces DRM token inheritance!
     const resolveWithParams = (relativeUrl, manifestUrl) => {
       try {
         const manifestObj = new URL(manifestUrl);
         const resolvedObj = new URL(relativeUrl, manifestObj.href); 
-        
-        // Inject DRM tokens from Manifest URL into the Segment URL
         manifestObj.searchParams.forEach((val, key) => {
-          if (!resolvedObj.searchParams.has(key)) {
-            resolvedObj.searchParams.set(key, val);
-          }
+          if (!resolvedObj.searchParams.has(key)) resolvedObj.searchParams.set(key, val);
         });
         return resolvedObj.href;
       } catch (e) {
@@ -79,7 +73,7 @@ export async function onRequest(context) {
       }
     };
 
-    // --- 1. HLS (.m3u8) DUAL-ROUTING ---
+    // --- 4. HLS (.m3u8) DUAL-ROUTING ---
     if (isM3u8) {
       const text = await response.text();
       const lines = text.split('\n');
@@ -92,7 +86,6 @@ export async function onRequest(context) {
             return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
               try {
                 const absoluteWithTokens = resolveWithParams(p1, finalUrl);
-                // Route nested manifests back to THIS worker, and chunks to the SEGMENT worker
                 if (absoluteWithTokens.includes('.m3u')) {
                   return `URI="${manifestProxyBase}${encodeURIComponent(absoluteWithTokens)}"`;
                 }
@@ -129,40 +122,71 @@ export async function onRequest(context) {
       return newResponse;
     }
 
-    // --- 2. DASH (.mpd) ROUTING TO /Segmentsproxy ---
+    // --- 5. DASH (.mpd) ROUTING TO /Segmentsproxy ---
     if (isMpd) {
       const text = await response.text();
       let rewrittenText = text;
 
-      // Extract the absolute base directory
       let dashBaseUrl = finalUrl;
       const baseMatch = text.match(/<BaseURL>(.*?)<\/BaseURL>/);
       if (baseMatch) {
         try { dashBaseUrl = resolveWithParams(baseMatch[1].trim(), finalUrl); } catch (e) {}
       }
 
-      // Strip <Location> to keep ExoPlayer strictly inside our proxy environment
       rewrittenText = rewrittenText.replace(/<Location>.*?<\/Location>/g, "");
 
-      // Rewrite Segment Templates to route strictly to /Segmentsproxy
-      rewrittenText = rewrittenText.replace(/(media|initialization|sourceURL)="([^"]+)"/g, (match, attr, p1) => {
-        try {
-          const cleanP1 = p1.replace(/&amp;/g, '&');
-          const resolveBase = cleanP1.startsWith("http") ? finalUrl : dashBaseUrl;
-          const absoluteWithTokens = resolveWithParams(cleanP1.trim(), resolveBase);
-          
-          // Encode the target URL but restore $ so ExoPlayer's $Number$ variables don't break
-          const wrapped = segmentProxyBase + encodeURIComponent(absoluteWithTokens).replace(/%24/g, '$');
-          return `${attr}="${wrapped}"`;
-        } catch(e) { return match; }
+      // FIX 1: Process the entire SegmentTemplate to copy tokens from initialization -> media!
+      rewrittenText = rewrittenText.replace(/<(SegmentTemplate|SegmentURL)\s+([^>]+)>/g, (match, tagName, attrs) => {
+        let initTokens = "";
+        
+        // Grab the tokens from the initialization attribute
+        const initMatch = attrs.match(/initialization="([^"]+)"/);
+        if (initMatch) {
+           const initUrl = initMatch[1].replace(/&amp;/g, '&');
+           if (initUrl.includes('?')) {
+               initTokens = initUrl.substring(initUrl.indexOf('?'));
+           }
+        }
+
+        let newAttrs = attrs.replace(/(media|initialization|sourceURL|xlink:href)="([^"]+)"/g, (m, attr, p1) => {
+          try {
+            const cleanP1 = p1.replace(/&amp;/g, '&');
+            const resolveBase = cleanP1.startsWith("http") ? finalUrl : dashBaseUrl;
+            let absoluteWithTokens = resolveWithParams(cleanP1.trim(), resolveBase);
+
+            // If it's a media URL, forcefully inject the tokens we found in the initialization URL!
+            if (attr === 'media' && initTokens) {
+                const urlObj = new URL(absoluteWithTokens);
+                const initParams = new URLSearchParams(initTokens);
+                initParams.forEach((v, k) => {
+                    if (!urlObj.searchParams.has(k)) urlObj.searchParams.set(k, v);
+                });
+                absoluteWithTokens = urlObj.href;
+            }
+            
+            let wrapped = segmentProxyBase + encodeURIComponent(absoluteWithTokens);
+
+            // FIX 2: Restore DASH variables (like $Number%09d$) flawlessly so ExoPlayer can read them
+            wrapped = wrapped.replace(/%24/g, '$'); // Restores the $ signs
+            wrapped = wrapped.replace(/\$([^\$]+)\$/g, (m2, inner) => '$' + decodeURIComponent(inner) + '$'); // Restores %09d
+            
+            return `${attr}="${wrapped}"`;
+          } catch(e) { return m; }
+        });
+
+        return `<${tagName} ${newAttrs}>`;
       });
 
-      // Rewrite BaseURL tags to route strictly to /Segmentsproxy
+      // Rewrite BaseURLs just in case
       rewrittenText = rewrittenText.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
         try {
           const cleanP1 = p1.replace(/&amp;/g, '&');
           const absoluteWithTokens = resolveWithParams(cleanP1.trim(), finalUrl);
-          const wrapped = segmentProxyBase + encodeURIComponent(absoluteWithTokens).replace(/%24/g, '$');
+          let wrapped = segmentProxyBase + encodeURIComponent(absoluteWithTokens);
+          
+          wrapped = wrapped.replace(/%24/g, '$');
+          wrapped = wrapped.replace(/\$([^\$]+)\$/g, (m2, inner) => '$' + decodeURIComponent(inner) + '$');
+
           return `<BaseURL>${wrapped}</BaseURL>`;
         } catch(e) { return match; }
       });
@@ -178,14 +202,12 @@ export async function onRequest(context) {
         newResponse.headers.set(key, value);
       }
       
-      // Fix raw text issue by forcing MPD content type
       newResponse.headers.set("Content-Type", "application/dash+xml");
       newResponse.headers.set("Access-Control-Allow-Origin", "*");
       return newResponse;
     }
 
-    // --- 3. FALLBACK DIRECT PASSTHROUGH ---
-    // If a segment accidentally hits this worker, pass it through directly
+    // --- 6. FALLBACK DIRECT PASSTHROUGH ---
     const proxyResponse = new Response(response.body, response);
     proxyResponse.headers.delete("Access-Control-Allow-Origin");
     proxyResponse.headers.delete("Access-Control-Allow-Methods");
@@ -200,4 +222,4 @@ export async function onRequest(context) {
       headers: { "Access-Control-Allow-Origin": "*" }
     });
   }
-}
+                                          }
