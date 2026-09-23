@@ -23,7 +23,7 @@ export async function onRequest(context) {
 
   const finalTargetUrl = targetUrlObj.href;
 
-  // 2. Strict CORS Headers (CRUCIAL FIX FOR 416 & DASH CHUNKS)
+  // 2. Strict CORS Headers
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
@@ -42,7 +42,6 @@ export async function onRequest(context) {
   
   for (const [key, value] of clientHeaders.entries()) {
     const lowerKey = key.toLowerCase();
-    // Forward essential player headers, exclude host/origin to avoid CDN 403s
     if (!lowerKey.startsWith("cf-") && 
         !["host", "origin", "referer", "connection", "accept-encoding"].includes(lowerKey)) {
       fetchHeaders.set(key, value);
@@ -52,10 +51,6 @@ export async function onRequest(context) {
   if (!fetchHeaders.has("user-agent")) {
     fetchHeaders.set("user-agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
   }
-
-  // Force "identity" encoding to prevent the CDN/Cloudflare from zipping the segment.
-  // Zipping alters Content-Length and destroys byte-range mapping (416 error).
-  fetchHeaders.set("accept-encoding", "identity");
 
   try {
     const response = await fetch(finalTargetUrl, {
@@ -94,6 +89,7 @@ export async function onRequest(context) {
 
     const proxyBase = requestUrl.origin + requestUrl.pathname + "?url=";
 
+    // This helper extracts the tokens from the Manifest URL and mathematically merges them into the Segment URL
     const resolveAndKeepParams = (relativeUrl, baseUrl) => {
       try {
         const baseObj = new URL(baseUrl);
@@ -110,7 +106,7 @@ export async function onRequest(context) {
       }
     };
 
-    // --- 4. HLS (.m3u8) PERFECT PROXY ---
+    // --- 4. HLS (.m3u8) MANIFEST-ONLY PROXY ---
     if (isM3u8) {
       const text = await response.text();
       const lines = text.split("\n");
@@ -121,14 +117,18 @@ export async function onRequest(context) {
           return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
             try {
               const absoluteUrl = resolveAndKeepParams(p1, finalUrl);
-              return `URI="${proxyBase}${encodeURIComponent(absoluteUrl)}"`;
+              // Proxy nested playlists, but let video segments hit the native CDN directly!
+              if (absoluteUrl.includes(".m3u")) return `URI="${proxyBase}${encodeURIComponent(absoluteUrl)}"`;
+              return `URI="${absoluteUrl}"`; 
             } catch (e) { return match; }
           });
         }
         if (trimmed && !trimmed.startsWith("#")) {
           try {
             const absoluteUrl = resolveAndKeepParams(trimmed, finalUrl);
-            return proxyBase + encodeURIComponent(absoluteUrl);
+            // Proxy nested playlists, but let video segments hit the native CDN directly!
+            if (absoluteUrl.includes(".m3u")) return proxyBase + encodeURIComponent(absoluteUrl);
+            return absoluteUrl;
           } catch (e) { return line; }
         }
         return line;
@@ -144,7 +144,7 @@ export async function onRequest(context) {
       });
     }
 
-    // --- 5. DASH (.mpd) DRM PERFECT PROXY ---
+    // --- 5. DASH (.mpd) MANIFEST-ONLY PROXY ---
     if (isMpd) {
       const text = await response.text();
       let rewrittenText = text;
@@ -159,21 +159,25 @@ export async function onRequest(context) {
         } catch (e) {}
       }
 
+      // Rewrite BaseURLs to point DIRECTLY to the CDN (No proxyBase wrapper)
       rewrittenText = rewrittenText.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
         try {
           const absoluteUrl = resolveAndKeepParams(p1.trim(), finalUrl);
-          const wrapped = proxyBase + encodeURIComponent(absoluteUrl).replace(/%24/g, '$');
-          return `<BaseURL>${wrapped}</BaseURL>`;
+          const finalSegmentUrl = absoluteUrl.replace(/%24/g, '$').replace(/&/g, '&amp;');
+          return `<BaseURL>${finalSegmentUrl}</BaseURL>`;
         } catch (e) { return match; }
       });
 
+      // Rewrite initialization and media segments to point DIRECTLY to the CDN
       rewrittenText = rewrittenText.replace(/(media|initialization|sourceURL|xlink:href)="([^"]+)"/g, (match, attr, p2) => {
         try {
           const cleanP2 = p2.replace(/&amp;/g, '&'); 
           const resolveBase = cleanP2.startsWith("http") ? finalUrl : dashBaseUrl;
           const absoluteUrl = resolveAndKeepParams(cleanP2.trim(), resolveBase);
-          const wrapped = proxyBase + encodeURIComponent(absoluteUrl).replace(/%24/g, '$');
-          return `${attr}="${wrapped}"`;
+          
+          // Notice we DO NOT wrap this in proxyBase. The player will hit SonyLIV directly with the correct DRM tokens!
+          const finalSegmentUrl = absoluteUrl.replace(/%24/g, '$').replace(/&/g, '&amp;');
+          return `${attr}="${finalSegmentUrl}"`;
         } catch (e) { return match; }
       });
 
@@ -187,17 +191,18 @@ export async function onRequest(context) {
       });
     }
 
-    // --- 6. Direct Stream Proxy (For .ts, .m4s, .mp4 segments) ---
-    // NO MORE FORCED OVERRIDES. We keep the EXACT original headers and content format!
+    // --- 6. Direct Stream Proxy (Fallback Only) ---
+    // If you happen to hit the proxy with a media segment directly, we force the correct Content-Type to prevent "proxy.bin" downloads.
     const proxyHeaders = new Headers(response.headers);
-    
-    // Clean only what is necessary to bypass CORS and prevent forced downloads
     proxyHeaders.delete("Access-Control-Allow-Origin");
     proxyHeaders.delete("Access-Control-Allow-Methods");
     proxyHeaders.delete("Access-Control-Allow-Headers");
-    proxyHeaders.delete("Content-Disposition"); 
+    proxyHeaders.delete("Content-Disposition"); // Stop forced downloads
 
-    // Inject strict CORS
+    if (lowerUrl.includes(".m4s")) proxyHeaders.set("Content-Type", "video/iso.segment");
+    else if (lowerUrl.includes(".mp4")) proxyHeaders.set("Content-Type", "video/mp4");
+    else if (lowerUrl.includes(".ts")) proxyHeaders.set("Content-Type", "video/MP2T");
+
     Object.entries(corsHeaders).forEach(([k, v]) => proxyHeaders.set(k, v));
 
     return new Response(response.body, {
@@ -212,4 +217,4 @@ export async function onRequest(context) {
       headers: corsHeaders,
     });
   }
-        }
+}
