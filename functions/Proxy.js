@@ -23,11 +23,13 @@ export async function onRequest(context) {
 
   const finalTargetUrl = targetUrlObj.href;
 
-  // 2. Standardized CORS Headers
+  // 2. Strict CORS Headers (CRUCIAL FIX FOR 416 & DOWNLOAD BUGS)
+  // "Expose-Headers" allows ExoPlayer to read the byte ranges. Without this, DASH completely breaks!
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Headers": "Range, Origin, X-Requested-With, Content-Type, Accept, Authorization, x-dt-auth, If-Match, If-None-Match",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, Server, Transfer-Encoding",
   };
 
   // Handle preflight requests
@@ -35,17 +37,26 @@ export async function onRequest(context) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 3. Set bypass headers. CRITICAL: 'range' prevents EOFExceptions in DASH chunks!
+  // 3. Set bypass headers safely
   const fetchHeaders = new Headers();
   const clientHeaders = context.request.headers;
   
-  const allowedHeaders = ["cookie", "authorization", "x-dt-auth", "range"];
-  allowedHeaders.forEach(h => {
-    if (clientHeaders.has(h)) fetchHeaders.set(h, clientHeaders.get(h));
-  });
+  for (const [key, value] of clientHeaders.entries()) {
+    const lowerKey = key.toLowerCase();
+    // Forward essential player headers, exclude host/origin to avoid CDN 403s
+    if (!lowerKey.startsWith("cf-") && 
+        !["host", "origin", "referer", "connection", "accept-encoding"].includes(lowerKey)) {
+      fetchHeaders.set(key, value);
+    }
+  }
 
-  fetchHeaders.set("User-Agent", clientHeaders.get("user-agent") || "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
-  fetchHeaders.set("Accept", "*/*");
+  if (!fetchHeaders.has("user-agent")) {
+    fetchHeaders.set("user-agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
+  }
+
+  // FIX 416: Force "identity" encoding to prevent the CDN or Cloudflare from zipping the segment.
+  // Zipping alters Content-Length and completely destroys byte-range mapping!
+  fetchHeaders.set("accept-encoding", "identity");
 
   try {
     const response = await fetch(finalTargetUrl, {
@@ -71,6 +82,7 @@ export async function onRequest(context) {
           lowerKey === "content-encoding" ||
           lowerKey === "content-length" ||
           lowerKey === "content-type" ||
+          lowerKey === "content-disposition" || // Prevent download prompts
           lowerKey.startsWith("access-control-")
         ) {
           continue;
@@ -83,15 +95,11 @@ export async function onRequest(context) {
 
     const proxyBase = requestUrl.origin + requestUrl.pathname + "?url=";
 
-    // CORE FIX: JavaScript's new URL() inherently strips query parameters.
-    // This helper safely resolves paths and forces the token inheritance 
-    // exactly like ExoPlayer does, preventing both Token Loss and Token Duplication.
     const resolveAndKeepParams = (relativeUrl, baseUrl) => {
       try {
         const baseObj = new URL(baseUrl);
         const resolvedObj = new URL(relativeUrl, baseUrl);
         
-        // Merge DRM tokens from Base/Manifest URL to the newly resolved URL
         baseObj.searchParams.forEach((val, key) => {
           if (!resolvedObj.searchParams.has(key)) {
             resolvedObj.searchParams.set(key, val);
@@ -142,7 +150,6 @@ export async function onRequest(context) {
       const text = await response.text();
       let rewrittenText = text;
 
-      // Strip <Location> tags. If present, players use this to bypass the proxy, breaking CORS!
       rewrittenText = rewrittenText.replace(/<Location>.*?<\/Location>/g, "");
 
       let dashBaseUrl = finalUrl;
@@ -153,7 +160,6 @@ export async function onRequest(context) {
         } catch (e) {}
       }
 
-      // Rewrite <BaseURL> tags
       rewrittenText = rewrittenText.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
         try {
           const absoluteUrl = resolveAndKeepParams(p1.trim(), finalUrl);
@@ -162,15 +168,11 @@ export async function onRequest(context) {
         } catch (e) { return match; }
       });
 
-      // Rewrite media="", initialization="", sourceURL="", and xlink:href="" safely
       rewrittenText = rewrittenText.replace(/(media|initialization|sourceURL|xlink:href)="([^"]+)"/g, (match, attr, p2) => {
         try {
-          const cleanP2 = p2.replace(/&amp;/g, '&'); // Clean upstream XML formatting
+          const cleanP2 = p2.replace(/&amp;/g, '&'); 
           const resolveBase = cleanP2.startsWith("http") ? finalUrl : dashBaseUrl;
-          
           const absoluteUrl = resolveAndKeepParams(cleanP2.trim(), resolveBase);
-          
-          // Wrap in proxy and restore $ variables for ExoPlayer template loading ($Number$, $Time$)
           const wrapped = proxyBase + encodeURIComponent(absoluteUrl).replace(/%24/g, '$');
           return `${attr}="${wrapped}"`;
         } catch (e) { return match; }
@@ -186,11 +188,15 @@ export async function onRequest(context) {
       });
     }
 
-    // --- 6. Direct Stream Proxy (For .ts, .m4s segments, initialization files, keys) ---
+    // --- 6. Direct Stream Proxy (For .ts, .m4s segments) ---
     const proxyHeaders = new Headers(response.headers);
     proxyHeaders.delete("Access-Control-Allow-Origin");
     proxyHeaders.delete("Access-Control-Allow-Methods");
     proxyHeaders.delete("Access-Control-Allow-Headers");
+    
+    // FIX DOWNLOAD BUGS: Ensure the CDN doesn't force a file download trigger
+    proxyHeaders.delete("Content-Disposition"); 
+
     Object.entries(corsHeaders).forEach(([k, v]) => proxyHeaders.set(k, v));
 
     return new Response(response.body, {
@@ -205,4 +211,4 @@ export async function onRequest(context) {
       headers: corsHeaders,
     });
   }
-}
+          }
