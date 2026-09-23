@@ -2,98 +2,68 @@ export async function onRequest(context) {
   const requestUrl = new URL(context.request.url);
   const targetParam = requestUrl.searchParams.get("url");
 
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-    "Access-Control-Allow-Headers":
-      "Range, Origin, X-Requested-With, Content-Type, Accept, Authorization, x-dt-auth, If-Match, If-None-Match",
-    "Access-Control-Expose-Headers":
-      "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, Server, Transfer-Encoding",
-    "Access-Control-Max-Age": "86400",
-  };
-
   if (!targetParam) {
-    return new Response("Missing url parameter. Usage: ?url=https://...", {
-      status: 400,
-      headers: corsHeaders,
-    });
+    return new Response("Missing url parameter", { status: 400 });
   }
 
+  // 1. Reconstruct the Target URL perfectly, preserving any extra auth tokens
   let targetUrlObj;
   try {
     targetUrlObj = new URL(targetParam);
   } catch (e) {
-    return new Response("Invalid url parameter passed.", { status: 400, headers: corsHeaders });
+    return new Response("Invalid url parameter", { status: 400 });
   }
 
   requestUrl.searchParams.forEach((value, key) => {
-    if (key !== "url") targetUrlObj.searchParams.set(key, value);
+    if (key !== "url") {
+      targetUrlObj.searchParams.set(key, value);
+    }
   });
 
   const finalTargetUrl = targetUrlObj.href;
 
+  // 2. Standardized CORS Headers
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type, Accept-Ranges, Date, Server, Transfer-Encoding",
+  };
+
+  // Handle CORS preflight requests
   if (context.request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders });
+    return new Response(null, { headers: corsHeaders });
   }
 
+  // 3. Set the specific User-Agent and pass essential streaming headers (like Range)
   const fetchHeaders = new Headers();
-  for (const [key, value] of context.request.headers.entries()) {
-    const lk = key.toLowerCase();
-    if (
-      !lk.startsWith("cf-") &&
-      !["host", "origin", "referer", "connection", "accept-encoding"].includes(lk)
-    ) {
-      fetchHeaders.set(key, value);
-    }
-  }
-  if (!fetchHeaders.has("user-agent")) {
-    fetchHeaders.set("user-agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
-  }
+  const clientHeaders = context.request.headers;
+  
+  fetchHeaders.set("User-Agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
+  fetchHeaders.set("Accept", "*/*");
 
-  // --- SonyLIV / Akamai specific: forward hdnea as a Cookie ---
-  // The hdnea token is often expected as a cookie, not just a query param.
-  if (!fetchHeaders.has("cookie")) {
-    const hdnea = targetUrlObj.searchParams.get("hdnea");
-    if (hdnea) {
-      fetchHeaders.set("cookie", `hdnea=${hdnea}`);
-    }
-  }
-
-  // Also forward the Referer / Origin that the CDN expects
-  if (!fetchHeaders.has("referer")) {
-    fetchHeaders.set("referer", "https://www.sonyliv.com/");
-  }
+  // CRUCIAL: Forward Range and Auth headers so the CDN sends the exact chunk size needed
+  ["range", "cookie", "authorization", "x-dt-auth"].forEach(h => {
+    if (clientHeaders.has(h)) fetchHeaders.set(h, clientHeaders.get(h));
+  });
 
   try {
     const response = await fetch(finalTargetUrl, {
       method: context.request.method,
       headers: fetchHeaders,
-      redirect: "follow",
+      redirect: "follow"
     });
-
-    // Log upstream status for debugging
-    console.log(`Upstream fetch to ${finalTargetUrl} returned ${response.status}`);
 
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
     const finalUrl = response.url || finalTargetUrl;
     const lowerUrl = finalTargetUrl.toLowerCase();
-    const lowerFinal = finalUrl.toLowerCase();
 
-    const isM3u8 =
-      lowerUrl.includes(".m3u") ||
-      lowerFinal.includes(".m3u") ||
-      contentType.includes("mpegurl");
-    const isMpd =
-      lowerUrl.includes(".mpd") ||
-      lowerFinal.includes(".mpd") ||
-      contentType.includes("dash+xml");
+    const isM3u8 = lowerUrl.includes(".m3u") || finalUrl.toLowerCase().includes(".m3u") || contentType.includes("mpegurl");
+    const isMpd = lowerUrl.includes(".mpd") || finalUrl.toLowerCase().includes(".mpd") || contentType.includes("dash+xml");
 
     const proxyBase = requestUrl.origin + requestUrl.pathname + "?url=";
 
-    // Preserve $...$ template vars for DASH
-    const enc = (u) => encodeURIComponent(u).replace(/%24/g, "$");
-    const wrap = (u) => proxyBase + enc(u);
-
+    // Helper: Safely inherit DRM tokens into relative manifest paths
     const resolveAndKeepParams = (relativeUrl, baseUrl) => {
       try {
         const baseObj = new URL(baseUrl);
@@ -102,159 +72,116 @@ export async function onRequest(context) {
           if (!resolvedObj.searchParams.has(key)) resolvedObj.searchParams.set(key, val);
         });
         return resolvedObj.href;
-      } catch (e) {
-        return relativeUrl;
-      }
+      } catch (e) { return relativeUrl; }
     };
 
-    const withCors = (extra = {}) => {
-      const h = new Headers();
-      Object.entries(corsHeaders).forEach(([k, v]) => h.set(k, v));
-      Object.entries(extra).forEach(([k, v]) => h.set(k, v));
-      return h;
-    };
-
-    // ============== HLS (.m3u8) ==============
+    // --- 4. HLS (.m3u8) PROXY ---
     if (isM3u8) {
       const text = await response.text();
-      const lines = text.split("\n");
+      const lines = text.split('\n');
 
-      const rewrittenLines = lines.map((line) => {
+      const rewrittenLines = lines.map(line => {
         const trimmed = line.trim();
-
-        if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
+        if (trimmed.startsWith('#') && trimmed.includes('URI="')) {
           return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
             try {
-              const abs = resolveAndKeepParams(p1, finalUrl);
-              return `URI="${wrap(abs)}"`;
-            } catch (e) {
-              return match;
-            }
+              const absoluteUrl = resolveAndKeepParams(p1, finalUrl);
+              return `URI="${proxyBase}${encodeURIComponent(absoluteUrl)}"`;
+            } catch(e) { return match; }
           });
         }
-
-        if (trimmed && !trimmed.startsWith("#")) {
+        if (trimmed && !trimmed.startsWith('#')) {
           try {
-            const abs = resolveAndKeepParams(trimmed, finalUrl);
-            return wrap(abs);
-          } catch (e) {
-            return line;
-          }
+            const absoluteUrl = resolveAndKeepParams(trimmed, finalUrl);
+            return proxyBase + encodeURIComponent(absoluteUrl);
+          } catch(e) { return line; }
         }
-
         return line;
       });
-
-      return new Response(rewrittenLines.join("\n"), {
+      
+      const newResponse = new Response(rewrittenLines.join('\n'), {
         status: response.status,
-        statusText: response.statusText,
-        headers: withCors({
-          "Content-Type": "application/vnd.apple.mpegurl",
-          "Cache-Control": "no-store",
-        }),
+        statusText: response.statusText
       });
+      
+      for (const [key, value] of response.headers.entries()) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === 'content-encoding' || lowerKey === 'content-length' || lowerKey.startsWith('access-control-')) continue;
+        newResponse.headers.set(key, value);
+      }
+      Object.entries(corsHeaders).forEach(([k, v]) => newResponse.headers.set(k, v));
+      return newResponse;
     }
 
-    // ============== DASH (.mpd) ==============
+    // --- 5. DASH (.mpd) PROXY ---
     if (isMpd) {
-      let text = await response.text();
+      const text = await response.text();
+      let rewrittenText = text;
 
-      text = text.replace(/<Location>.*?<\/Location>/g, "");
+      // Strip <Location> to force the player to stay inside our proxy
+      rewrittenText = rewrittenText.replace(/<Location>.*?<\/Location>/g, "");
 
-      let dashBase = finalUrl;
+      let dashBaseUrl = finalUrl;
       const baseMatch = text.match(/<BaseURL>(.*?)<\/BaseURL>/);
       if (baseMatch) {
-        try {
-          dashBase = resolveAndKeepParams(baseMatch[1].trim(), finalUrl);
-        } catch (e) {}
+        try { dashBaseUrl = resolveAndKeepParams(baseMatch[1].trim(), finalUrl); } catch (e) {}
       }
 
-      text = text.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
+      rewrittenText = rewrittenText.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
         try {
-          const abs = resolveAndKeepParams(p1.trim(), finalUrl);
-          return `<BaseURL>${abs.replace(/&/g, "&amp;")}</BaseURL>`;
-        } catch (e) {
-          return match;
-        }
+          const absoluteUrl = resolveAndKeepParams(p1.trim(), finalUrl);
+          const wrapped = proxyBase + encodeURIComponent(absoluteUrl).replace(/%24/g, '$');
+          return `<BaseURL>${wrapped}</BaseURL>`;
+        } catch (e) { return match; }
       });
 
-      text = text.replace(
-        /(media|initialization|sourceURL|xlink:href)="([^"]+)"/g,
-        (match, attr, p2) => {
-          try {
-            const clean = p2.replace(/&amp;/g, "&");
-            const abs = resolveAndKeepParams(clean.trim(), dashBase);
-            const proxied = wrap(abs).replace(/&/g, "&amp;");
-            return `${attr}="${proxied}"`;
-          } catch (e) {
-            return match;
-          }
-        }
-      );
-
-      return new Response(text, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: withCors({
-          "Content-Type": "application/dash+xml",
-          "Cache-Control": "no-store",
-        }),
+      rewrittenText = rewrittenText.replace(/(media|initialization|sourceURL|xlink:href)="([^"]+)"/g, (match, attr, p2) => {
+        try {
+          const cleanP2 = p2.replace(/&amp;/g, '&'); 
+          const resolveBase = cleanP2.startsWith("http") ? finalUrl : dashBaseUrl;
+          const absoluteUrl = resolveAndKeepParams(cleanP2.trim(), resolveBase);
+          const wrapped = proxyBase + encodeURIComponent(absoluteUrl).replace(/%24/g, '$');
+          return `${attr}="${wrapped}"`;
+        } catch (e) { return match; }
       });
-    }
 
-    // ============== Media segment passthrough ==============
-    const proxyHeaders = new Headers();
-
-    for (const [key, value] of response.headers.entries()) {
-      const lk = key.toLowerCase();
-      if (
-        lk === "content-encoding" ||
-        lk === "content-length" ||
-        lk === "content-type" ||
-        lk === "content-disposition" ||
-        lk === "transfer-encoding" ||
-        lk === "connection" ||
-        lk === "set-cookie" ||
-        lk.startsWith("access-control-")
-      ) {
-        continue;
-      }
-      proxyHeaders.set(key, value);
-    }
-
-    const pathOnly = lowerFinal.split("?")[0];
-    let forcedType = null;
-    if (/\.(m4s|m4v|m4a|mp4|cmfv|cmfa)$/.test(pathOnly)) forcedType = "video/mp4";
-    else if (/\.ts$/.test(pathOnly)) forcedType = "video/mp2t";
-    else if (/\.aac$/.test(pathOnly)) forcedType = "audio/aac";
-    else if (/\.mp3$/.test(pathOnly)) forcedType = "audio/mpeg";
-    else if (/\.vtt$/.test(pathOnly)) forcedType = "text/vtt";
-    else if (/\.key$/.test(pathOnly)) forcedType = "application/octet-stream";
-
-    proxyHeaders.set("Content-Type", forcedType || contentType || "application/octet-stream");
-    proxyHeaders.set("Content-Disposition", "inline");
-
-    Object.entries(corsHeaders).forEach(([k, v]) => proxyHeaders.set(k, v));
-
-    return new Response(
-      context.request.method === "HEAD" ? null : response.body,
-      {
+      const newResponse = new Response(rewrittenText, {
         status: response.status,
-        statusText: response.statusText,
-        headers: proxyHeaders,
+        statusText: response.statusText
+      });
+
+      for (const [key, value] of response.headers.entries()) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === 'content-encoding' || lowerKey === 'content-length' || lowerKey.startsWith('access-control-')) continue;
+        newResponse.headers.set(key, value);
       }
-    );
+      // Force correct MPD content type
+      newResponse.headers.set("Content-Type", "application/dash+xml");
+      Object.entries(corsHeaders).forEach(([k, v]) => newResponse.headers.set(k, v));
+      return newResponse;
+    }
+
+    // --- 6. DIRECT STREAM PROXY (For .ts, .m4s, .mp4 segments) ---
+    // EXACTLY as you requested: we stream the bytes through perfectly natively, 
+    // maintaining the original CDN Content-Type, while injecting CORS to fix browser buffering!
+    const proxyResponse = new Response(response.body, response);
+    
+    // Clear the original CDN's CORS to prevent duplicate "*, *" errors
+    proxyResponse.headers.delete("Access-Control-Allow-Origin");
+    proxyResponse.headers.delete("Access-Control-Allow-Methods");
+    proxyResponse.headers.delete("Access-Control-Allow-Headers");
+    proxyResponse.headers.delete("Access-Control-Expose-Headers");
+    proxyResponse.headers.delete("Content-Disposition"); // Stop browser download prompts
+
+    // Apply our master CORS headers
+    Object.entries(corsHeaders).forEach(([k, v]) => proxyResponse.headers.set(k, v));
+
+    return proxyResponse;
+
   } catch (e) {
-    // Return a readable error so you can see what failed
-    return new Response(
-      `Proxy error: ${e.message}\n\nTarget: ${finalTargetUrl}`,
-      {
-        status: 502,
-        headers: {
-          "Content-Type": "text/plain",
-          ...corsHeaders,
-        },
-      }
-    );
+    return new Response("Error fetching stream: " + e.message, { 
+      status: 500,
+      headers: corsHeaders
+    });
   }
       }
