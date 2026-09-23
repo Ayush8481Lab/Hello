@@ -23,7 +23,7 @@ export async function onRequest(context) {
 
   const finalTargetUrl = targetUrlObj.href;
 
-  // 2. Strict CORS Headers (CRUCIAL FIX FOR 416 & DOWNLOAD BUGS)
+  // 2. Strict CORS Headers (CRUCIAL FIX FOR 416 & DASH CHUNKS)
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
@@ -53,7 +53,8 @@ export async function onRequest(context) {
     fetchHeaders.set("user-agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
   }
 
-  // FIX 416: Force "identity" encoding to prevent the CDN or Cloudflare from zipping the segment.
+  // Force "identity" encoding to prevent the CDN/Cloudflare from zipping the segment.
+  // Zipping alters Content-Length and destroys byte-range mapping (416 error).
   fetchHeaders.set("accept-encoding", "identity");
 
   try {
@@ -80,7 +81,7 @@ export async function onRequest(context) {
           lowerKey === "content-encoding" ||
           lowerKey === "content-length" ||
           lowerKey === "content-type" ||
-          lowerKey === "content-disposition" || // Prevent download prompts
+          lowerKey === "content-disposition" || 
           lowerKey.startsWith("access-control-")
         ) {
           continue;
@@ -187,30 +188,14 @@ export async function onRequest(context) {
     }
 
     // --- 6. Direct Stream Proxy (For .ts, .m4s, .mp4 segments) ---
+    // NO MORE FORCED OVERRIDES. We keep the EXACT original headers and content format!
     const proxyHeaders = new Headers(response.headers);
     
-    // Clean headers
+    // Clean only what is necessary to bypass CORS and prevent forced downloads
     proxyHeaders.delete("Access-Control-Allow-Origin");
     proxyHeaders.delete("Access-Control-Allow-Methods");
     proxyHeaders.delete("Access-Control-Allow-Headers");
-    
-    // FIX DOWNLOAD BUGS: Ensure the CDN doesn't force a file download trigger
     proxyHeaders.delete("Content-Disposition"); 
-
-    // FIX "PROXY.BIN" DOWNLOAD: Force correct media MIME types based on the URL
-    if (lowerUrl.includes(".m4s")) {
-      proxyHeaders.set("Content-Type", "video/iso.segment");
-    } else if (lowerUrl.includes(".mp4")) {
-      proxyHeaders.set("Content-Type", "video/mp4");
-    } else if (lowerUrl.includes(".ts")) {
-      proxyHeaders.set("Content-Type", "video/MP2T");
-    } else if (lowerUrl.includes(".aac")) {
-      proxyHeaders.set("Content-Type", "audio/aac");
-    } else if (lowerUrl.includes(".ac3")) {
-      proxyHeaders.set("Content-Type", "audio/ac3");
-    } else if (lowerUrl.includes(".vtt")) {
-      proxyHeaders.set("Content-Type", "text/vtt");
-    }
 
     // Inject strict CORS
     Object.entries(corsHeaders).forEach(([k, v]) => proxyHeaders.set(k, v));
@@ -227,4 +212,4 @@ export async function onRequest(context) {
       headers: corsHeaders,
     });
   }
-      }
+        }
