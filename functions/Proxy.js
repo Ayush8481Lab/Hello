@@ -2,7 +2,6 @@ export async function onRequest(context) {
   const requestUrl = new URL(context.request.url);
   const targetParam = requestUrl.searchParams.get("url");
 
-  // 2. Strict CORS Headers (defined early so every return path can use them)
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
@@ -20,7 +19,6 @@ export async function onRequest(context) {
     });
   }
 
-  // 1. RECONSTRUCT THE TARGET URL PERFECTLY
   let targetUrlObj;
   try {
     targetUrlObj = new URL(targetParam);
@@ -28,36 +26,42 @@ export async function onRequest(context) {
     return new Response("Invalid url parameter passed.", { status: 400, headers: corsHeaders });
   }
 
-  // Merge any extra proxy parameters into the target URL safely
   requestUrl.searchParams.forEach((value, key) => {
-    if (key !== "url") {
-      targetUrlObj.searchParams.set(key, value);
-    }
+    if (key !== "url") targetUrlObj.searchParams.set(key, value);
   });
 
   const finalTargetUrl = targetUrlObj.href;
 
-  // Handle preflight requests
   if (context.request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  // 3. Set bypass headers safely
   const fetchHeaders = new Headers();
-  const clientHeaders = context.request.headers;
-
-  for (const [key, value] of clientHeaders.entries()) {
-    const lowerKey = key.toLowerCase();
+  for (const [key, value] of context.request.headers.entries()) {
+    const lk = key.toLowerCase();
     if (
-      !lowerKey.startsWith("cf-") &&
-      !["host", "origin", "referer", "connection", "accept-encoding"].includes(lowerKey)
+      !lk.startsWith("cf-") &&
+      !["host", "origin", "referer", "connection", "accept-encoding"].includes(lk)
     ) {
       fetchHeaders.set(key, value);
     }
   }
-
   if (!fetchHeaders.has("user-agent")) {
     fetchHeaders.set("user-agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
+  }
+
+  // --- SonyLIV / Akamai specific: forward hdnea as a Cookie ---
+  // The hdnea token is often expected as a cookie, not just a query param.
+  if (!fetchHeaders.has("cookie")) {
+    const hdnea = targetUrlObj.searchParams.get("hdnea");
+    if (hdnea) {
+      fetchHeaders.set("cookie", `hdnea=${hdnea}`);
+    }
+  }
+
+  // Also forward the Referer / Origin that the CDN expects
+  if (!fetchHeaders.has("referer")) {
+    fetchHeaders.set("referer", "https://www.sonyliv.com/");
   }
 
   try {
@@ -67,56 +71,35 @@ export async function onRequest(context) {
       redirect: "follow",
     });
 
+    // Log upstream status for debugging
+    console.log(`Upstream fetch to ${finalTargetUrl} returned ${response.status}`);
+
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
     const finalUrl = response.url || finalTargetUrl;
     const lowerUrl = finalTargetUrl.toLowerCase();
+    const lowerFinal = finalUrl.toLowerCase();
 
-    // Detect format
     const isM3u8 =
       lowerUrl.includes(".m3u") ||
-      finalUrl.toLowerCase().includes(".m3u") ||
+      lowerFinal.includes(".m3u") ||
       contentType.includes("mpegurl");
     const isMpd =
       lowerUrl.includes(".mpd") ||
-      finalUrl.toLowerCase().includes(".mpd") ||
+      lowerFinal.includes(".mpd") ||
       contentType.includes("dash+xml");
 
-    // Helper: Safely copy response headers avoiding conflicts
-    const copyCleanHeaders = () => {
-      const newHeaders = new Headers();
-      for (const [key, value] of response.headers.entries()) {
-        const lowerKey = key.toLowerCase();
-        if (
-          lowerKey === "content-encoding" ||
-          lowerKey === "content-length" ||
-          lowerKey === "content-type" ||
-          lowerKey === "content-disposition" ||
-          lowerKey === "transfer-encoding" ||
-          lowerKey === "connection" ||
-          lowerKey === "set-cookie" ||
-          lowerKey.startsWith("access-control-")
-        ) {
-          continue;
-        }
-        newHeaders.set(key, value);
-      }
-      Object.entries(corsHeaders).forEach(([k, v]) => newHeaders.set(k, v));
-      return newHeaders;
-    };
-
     const proxyBase = requestUrl.origin + requestUrl.pathname + "?url=";
-    const wrap = (absoluteUrl) => proxyBase + encodeURIComponent(absoluteUrl);
 
-    // This helper extracts the tokens from the Manifest URL and mathematically merges them into the Segment URL
+    // Preserve $...$ template vars for DASH
+    const enc = (u) => encodeURIComponent(u).replace(/%24/g, "$");
+    const wrap = (u) => proxyBase + enc(u);
+
     const resolveAndKeepParams = (relativeUrl, baseUrl) => {
       try {
         const baseObj = new URL(baseUrl);
         const resolvedObj = new URL(relativeUrl, baseUrl);
-
         baseObj.searchParams.forEach((val, key) => {
-          if (!resolvedObj.searchParams.has(key)) {
-            resolvedObj.searchParams.set(key, val);
-          }
+          if (!resolvedObj.searchParams.has(key)) resolvedObj.searchParams.set(key, val);
         });
         return resolvedObj.href;
       } catch (e) {
@@ -124,7 +107,14 @@ export async function onRequest(context) {
       }
     };
 
-    // --- 4. HLS (.m3u8) MANIFEST PROXY (playlists + segments) ---
+    const withCors = (extra = {}) => {
+      const h = new Headers();
+      Object.entries(corsHeaders).forEach(([k, v]) => h.set(k, v));
+      Object.entries(extra).forEach(([k, v]) => h.set(k, v));
+      return h;
+    };
+
+    // ============== HLS (.m3u8) ==============
     if (isM3u8) {
       const text = await response.text();
       const lines = text.split("\n");
@@ -132,23 +122,21 @@ export async function onRequest(context) {
       const rewrittenLines = lines.map((line) => {
         const trimmed = line.trim();
 
-        // Tag attributes: URI="..."  (EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, EXT-X-I-FRAME-STREAM-INF ...)
         if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
           return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
             try {
-              const absoluteUrl = resolveAndKeepParams(p1, finalUrl);
-              return `URI="${wrap(absoluteUrl)}"`;
+              const abs = resolveAndKeepParams(p1, finalUrl);
+              return `URI="${wrap(abs)}"`;
             } catch (e) {
               return match;
             }
           });
         }
 
-        // Segment / variant playlist lines -> always route through the proxy
         if (trimmed && !trimmed.startsWith("#")) {
           try {
-            const absoluteUrl = resolveAndKeepParams(trimmed, finalUrl);
-            return wrap(absoluteUrl);
+            const abs = resolveAndKeepParams(trimmed, finalUrl);
+            return wrap(abs);
           } catch (e) {
             return line;
           }
@@ -157,56 +145,46 @@ export async function onRequest(context) {
         return line;
       });
 
-      const newHeaders = copyCleanHeaders();
-      newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
-      newHeaders.set("Cache-Control", "no-store");
-
       return new Response(rewrittenLines.join("\n"), {
         status: response.status,
         statusText: response.statusText,
-        headers: newHeaders,
+        headers: withCors({
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Cache-Control": "no-store",
+        }),
       });
     }
 
-    // --- 5. DASH (.mpd) MANIFEST PROXY (BaseURL + SegmentTemplate) ---
+    // ============== DASH (.mpd) ==============
     if (isMpd) {
-      const text = await response.text();
-      let rewrittenText = text;
+      let text = await response.text();
 
-      rewrittenText = rewrittenText.replace(/<Location>.*?<\/Location>/g, "");
+      text = text.replace(/<Location>.*?<\/Location>/g, "");
 
-      let dashBaseUrl = finalUrl;
+      let dashBase = finalUrl;
       const baseMatch = text.match(/<BaseURL>(.*?)<\/BaseURL>/);
       if (baseMatch) {
         try {
-          dashBaseUrl = resolveAndKeepParams(baseMatch[1].trim(), finalUrl);
+          dashBase = resolveAndKeepParams(baseMatch[1].trim(), finalUrl);
         } catch (e) {}
       }
 
-      // $ placeholders (%24) must survive so the player can still expand $Number$ / $RepresentationID$
-      const restorePlaceholders = (s) => s.replace(/%24/g, () => "$");
-
-      // Rewrite BaseURLs -> proxy
-      rewrittenText = rewrittenText.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
+      text = text.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
         try {
-          const absoluteUrl = resolveAndKeepParams(p1.trim(), finalUrl);
-          const proxied = restorePlaceholders(wrap(absoluteUrl)).replace(/&/g, "&amp;");
-          return `<BaseURL>${proxied}</BaseURL>`;
+          const abs = resolveAndKeepParams(p1.trim(), finalUrl);
+          return `<BaseURL>${abs.replace(/&/g, "&amp;")}</BaseURL>`;
         } catch (e) {
           return match;
         }
       });
 
-      // Rewrite initialization / media / sourceURL / xlink:href -> proxy
-      rewrittenText = rewrittenText.replace(
+      text = text.replace(
         /(media|initialization|sourceURL|xlink:href)="([^"]+)"/g,
         (match, attr, p2) => {
           try {
-            const cleanP2 = p2.replace(/&amp;/g, "&");
-            const resolveBase = cleanP2.startsWith("http") ? finalUrl : dashBaseUrl;
-            const absoluteUrl = resolveAndKeepParams(cleanP2.trim(), resolveBase);
-
-            const proxied = restorePlaceholders(wrap(absoluteUrl)).replace(/&/g, "&amp;");
+            const clean = p2.replace(/&amp;/g, "&");
+            const abs = resolveAndKeepParams(clean.trim(), dashBase);
+            const proxied = wrap(abs).replace(/&/g, "&amp;");
             return `${attr}="${proxied}"`;
           } catch (e) {
             return match;
@@ -214,19 +192,17 @@ export async function onRequest(context) {
         }
       );
 
-      const newHeaders = copyCleanHeaders();
-      newHeaders.set("Content-Type", "application/dash+xml");
-      newHeaders.set("Cache-Control", "no-store");
-
-      return new Response(rewrittenText, {
+      return new Response(text, {
         status: response.status,
         statusText: response.statusText,
-        headers: newHeaders,
+        headers: withCors({
+          "Content-Type": "application/dash+xml",
+          "Cache-Control": "no-store",
+        }),
       });
     }
 
-    // --- 6. Media Segment Proxy (.mp4 / .m4s / .ts / .aac / keys ...) ---
-    // This is where CORS is actually granted and the forced download is killed.
+    // ============== Media segment passthrough ==============
     const proxyHeaders = new Headers();
 
     for (const [key, value] of response.headers.entries()) {
@@ -235,7 +211,7 @@ export async function onRequest(context) {
         lk === "content-encoding" ||
         lk === "content-length" ||
         lk === "content-type" ||
-        lk === "content-disposition" ||   // <-- this is what caused the "download" popup
+        lk === "content-disposition" ||
         lk === "transfer-encoding" ||
         lk === "connection" ||
         lk === "set-cookie" ||
@@ -243,13 +219,10 @@ export async function onRequest(context) {
       ) {
         continue;
       }
-      proxyHeaders.set(key, value); // keeps Content-Range, Accept-Ranges, ETag, Last-Modified ...
+      proxyHeaders.set(key, value);
     }
 
-    // Force a playable Content-Type based on the real (post-redirect) path
-    const finalLower = (response.url || finalTargetUrl).toLowerCase();
-    const pathOnly = finalLower.split("?")[0];
-
+    const pathOnly = lowerFinal.split("?")[0];
     let forcedType = null;
     if (/\.(m4s|m4v|m4a|mp4|cmfv|cmfa)$/.test(pathOnly)) forcedType = "video/mp4";
     else if (/\.ts$/.test(pathOnly)) forcedType = "video/mp2t";
@@ -259,21 +232,29 @@ export async function onRequest(context) {
     else if (/\.key$/.test(pathOnly)) forcedType = "application/octet-stream";
 
     proxyHeaders.set("Content-Type", forcedType || contentType || "application/octet-stream");
-    // Never let the browser treat this as a file download
     proxyHeaders.set("Content-Disposition", "inline");
 
     Object.entries(corsHeaders).forEach(([k, v]) => proxyHeaders.set(k, v));
 
-    return new Response(context.request.method === "HEAD" ? null : response.body, {
-      status: response.status,          // preserves 200 / 206 (Range)
-      statusText: response.statusText,
-      headers: proxyHeaders,
-    });
-
+    return new Response(
+      context.request.method === "HEAD" ? null : response.body,
+      {
+        status: response.status,
+        statusText: response.statusText,
+        headers: proxyHeaders,
+      }
+    );
   } catch (e) {
-    return new Response("Error fetching stream: " + e.message, {
-      status: 500,
-      headers: corsHeaders,
-    });
+    // Return a readable error so you can see what failed
+    return new Response(
+      `Proxy error: ${e.message}\n\nTarget: ${finalTargetUrl}`,
+      {
+        status: 502,
+        headers: {
+          "Content-Type": "text/plain",
+          ...corsHeaders,
+        },
+      }
+    );
   }
-}
+      }
