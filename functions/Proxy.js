@@ -24,7 +24,6 @@ export async function onRequest(context) {
   const finalTargetUrl = targetUrlObj.href;
 
   // 2. Strict CORS Headers (CRUCIAL FIX FOR 416 & DOWNLOAD BUGS)
-  // "Expose-Headers" allows ExoPlayer to read the byte ranges. Without this, DASH completely breaks!
   const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
@@ -55,7 +54,6 @@ export async function onRequest(context) {
   }
 
   // FIX 416: Force "identity" encoding to prevent the CDN or Cloudflare from zipping the segment.
-  // Zipping alters Content-Length and completely destroys byte-range mapping!
   fetchHeaders.set("accept-encoding", "identity");
 
   try {
@@ -188,8 +186,10 @@ export async function onRequest(context) {
       });
     }
 
-    // --- 6. Direct Stream Proxy (For .ts, .m4s segments) ---
+    // --- 6. Direct Stream Proxy (For .ts, .m4s, .mp4 segments) ---
     const proxyHeaders = new Headers(response.headers);
+    
+    // Clean headers
     proxyHeaders.delete("Access-Control-Allow-Origin");
     proxyHeaders.delete("Access-Control-Allow-Methods");
     proxyHeaders.delete("Access-Control-Allow-Headers");
@@ -197,6 +197,22 @@ export async function onRequest(context) {
     // FIX DOWNLOAD BUGS: Ensure the CDN doesn't force a file download trigger
     proxyHeaders.delete("Content-Disposition"); 
 
+    // FIX "PROXY.BIN" DOWNLOAD: Force correct media MIME types based on the URL
+    if (lowerUrl.includes(".m4s")) {
+      proxyHeaders.set("Content-Type", "video/iso.segment");
+    } else if (lowerUrl.includes(".mp4")) {
+      proxyHeaders.set("Content-Type", "video/mp4");
+    } else if (lowerUrl.includes(".ts")) {
+      proxyHeaders.set("Content-Type", "video/MP2T");
+    } else if (lowerUrl.includes(".aac")) {
+      proxyHeaders.set("Content-Type", "audio/aac");
+    } else if (lowerUrl.includes(".ac3")) {
+      proxyHeaders.set("Content-Type", "audio/ac3");
+    } else if (lowerUrl.includes(".vtt")) {
+      proxyHeaders.set("Content-Type", "text/vtt");
+    }
+
+    // Inject strict CORS
     Object.entries(corsHeaders).forEach(([k, v]) => proxyHeaders.set(k, v));
 
     return new Response(response.body, {
@@ -211,4 +227,4 @@ export async function onRequest(context) {
       headers: corsHeaders,
     });
   }
-          }
+      }
