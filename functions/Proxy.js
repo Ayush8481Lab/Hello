@@ -7,7 +7,6 @@ export async function onRequest(context) {
   }
 
   // RECONSTRUCT TARGET URL PERFECTLY: 
-  // This catches any DRM tokens (&hmac=, &exp=) that got separated from the 'url' parameter
   let targetUrlObj;
   try {
     targetUrlObj = new URL(targetParam);
@@ -34,7 +33,7 @@ export async function onRequest(context) {
     });
   }
 
-  // Set the specific User-Agent required by the SonyLIV streams (from the .m3u file)
+  // Set the specific User-Agent required by the streams
   const headers = new Headers();
   headers.set("User-Agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
 
@@ -45,17 +44,18 @@ export async function onRequest(context) {
       redirect: "follow"
     });
 
-    // Check if the response is an HLS playlist
-    const contentType = response.headers.get("content-type") || "";
-    const isM3u8 = finalTargetUrl.includes(".m3u8") || contentType.includes("mpegurl");
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const finalUrl = response.url || finalTargetUrl;
 
+    const isM3u8 = finalTargetUrl.includes(".m3u8") || contentType.includes("mpegurl");
+    const isMpd = finalTargetUrl.includes(".mpd") || contentType.includes("dash+xml");
+
+    // --- 1. HLS (.m3u8) PROXY (UNTOUCHED AS REQUESTED) ---
     if (isM3u8) {
-      // Rewrite the HLS playlist so relative URLs point back to our proxy!
       const text = await response.text();
       const lines = text.split('\n');
-      const finalUrl = response.url || finalTargetUrl; // Use the final redirected URL as the base!
 
-      const proxyBase = url.origin + '/proxy?url=';
+      const proxyBase = url.origin + '/Proxy?url=';
       
       const rewrittenLines = lines.map(line => {
         const trimmed = line.trim();
@@ -76,8 +76,6 @@ export async function onRequest(context) {
 
         if (trimmed && !trimmed.startsWith('#')) {
           try {
-            // Make URL absolute relative to the final redirected URL, then wrap in proxy
-            // This forces .ts segments to download through the proxy
             const absoluteUrl = new URL(trimmed, finalUrl).href;
             return proxyBase + encodeURIComponent(absoluteUrl);
           } catch(e) {
@@ -92,10 +90,8 @@ export async function onRequest(context) {
         statusText: response.statusText
       });
       
-      // Copy over headers and add CORS
       for (const [key, value] of response.headers.entries()) {
         const lowerKey = key.toLowerCase();
-        // Do not copy content-encoding or content-length because we rewrote the body!
         if (lowerKey === 'content-encoding' || lowerKey === 'content-length' || lowerKey.startsWith('access-control-')) {
           continue;
         }
@@ -105,30 +101,53 @@ export async function onRequest(context) {
       return newResponse;
     }
 
-    // --- PERFECT DASH/MP4 PASSTHROUGH ---
-    // We recreate the headers safely so we can modify them
-    const proxyHeaders = new Headers(response.headers);
-    
-    // Strip upstream CORS headers to prevent duplicate "*, *" errors
-    proxyHeaders.delete("Access-Control-Allow-Origin");
-    proxyHeaders.delete("Access-Control-Allow-Methods");
-    proxyHeaders.delete("Access-Control-Allow-Headers");
-    
-    // FIX: If the file is an MPD manifest, force the correct DASH XML Content-Type!
-    // This stops the browser from showing raw XML text.
-    if (finalTargetUrl.includes(".mpd") || contentType.includes("dash+xml")) {
-      proxyHeaders.set("Content-Type", "application/dash+xml");
+    // --- 2. DASH (.mpd) MANIFEST REWRITE ---
+    if (isMpd) {
+      const text = await response.text();
+      
+      // Extract the absolute base directory of the original CDN URL
+      const urlObj = new URL(finalUrl);
+      const basePath = urlObj.origin + urlObj.pathname.substring(0, urlObj.pathname.lastIndexOf('/') + 1);
+
+      // Rewrite segment templates (media, initialization) to point DIRECTLY to the CDN!
+      let rewrittenText = text.replace(/(media|initialization|sourceURL)="([^"]+)"/g, (match, attr, p1) => {
+        if (p1.startsWith("http")) return match;
+        // Make the URL absolute to the CDN, and restore $ symbols for ExoPlayer templates
+        const absoluteUrl = new URL(p1, basePath).href.replace(/%24/g, '$');
+        return `${attr}="${absoluteUrl}"`;
+      });
+
+      // Rewrite BaseURL tags
+      rewrittenText = rewrittenText.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
+        if (p1.startsWith("http")) return match;
+        const absoluteUrl = new URL(p1.trim(), basePath).href.replace(/%24/g, '$');
+        return `<BaseURL>${absoluteUrl}</BaseURL>`;
+      });
+
+      const newHeaders = new Headers(response.headers);
+      newHeaders.delete("Access-Control-Allow-Origin");
+      newHeaders.delete("Access-Control-Allow-Methods");
+      newHeaders.delete("Access-Control-Allow-Headers");
+      
+      // FIX: Force correct DASH XML Content-Type so it's not raw text!
+      newHeaders.set("Content-Type", "application/dash+xml");
+      newHeaders.set("Access-Control-Allow-Origin", "*");
+
+      return new Response(rewrittenText, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: newHeaders
+      });
     }
+
+    // --- 3. DIRECT STREAM FALLBACK ---
+    const proxyResponse = new Response(response.body, response);
+    proxyResponse.headers.delete("Access-Control-Allow-Origin");
+    proxyResponse.headers.delete("Access-Control-Allow-Methods");
+    proxyResponse.headers.delete("Access-Control-Allow-Headers");
+    proxyResponse.headers.set("Access-Control-Allow-Origin", "*");
     
-    // Set our clean CORS headers
-    proxyHeaders.set("Access-Control-Allow-Origin", "*");
-    
-    // We pass `response.body` completely untouched so DRM chunks work natively!
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: proxyHeaders
-    });
+    return proxyResponse;
 
   } catch (e) {
     return new Response("Error fetching stream: " + e.message, { 
@@ -136,4 +155,4 @@ export async function onRequest(context) {
       headers: { "Access-Control-Allow-Origin": "*" }
     });
   }
-}
+                         }
