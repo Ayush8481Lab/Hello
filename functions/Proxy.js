@@ -14,7 +14,7 @@ export async function onRequest(context) {
     return new Response("Invalid url parameter passed.", { status: 400 });
   }
 
-  // Forward ALL extra query parameters to the target URL (handles separated HMACs/Tokens)
+  // Merge any extra proxy parameters into the target URL safely
   requestUrl.searchParams.forEach((value, key) => {
     if (key !== "url") {
       targetUrlObj.searchParams.set(key, value);
@@ -35,9 +35,16 @@ export async function onRequest(context) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // 3. Set standard Bypass Headers
+  // 3. Set bypass headers. CRITICAL: 'range' prevents EOFExceptions in DASH chunks!
   const fetchHeaders = new Headers();
-  fetchHeaders.set("User-Agent", "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
+  const clientHeaders = context.request.headers;
+  
+  const allowedHeaders = ["cookie", "authorization", "x-dt-auth", "range"];
+  allowedHeaders.forEach(h => {
+    if (clientHeaders.has(h)) fetchHeaders.set(h, clientHeaders.get(h));
+  });
+
+  fetchHeaders.set("User-Agent", clientHeaders.get("user-agent") || "plaYtv/7.1.5 (Linux;Android 14) ExoPlayerLib/2.11.7");
   fetchHeaders.set("Accept", "*/*");
 
   try {
@@ -76,6 +83,26 @@ export async function onRequest(context) {
 
     const proxyBase = requestUrl.origin + requestUrl.pathname + "?url=";
 
+    // CORE FIX: JavaScript's new URL() inherently strips query parameters.
+    // This helper safely resolves paths and forces the token inheritance 
+    // exactly like ExoPlayer does, preventing both Token Loss and Token Duplication.
+    const resolveAndKeepParams = (relativeUrl, baseUrl) => {
+      try {
+        const baseObj = new URL(baseUrl);
+        const resolvedObj = new URL(relativeUrl, baseUrl);
+        
+        // Merge DRM tokens from Base/Manifest URL to the newly resolved URL
+        baseObj.searchParams.forEach((val, key) => {
+          if (!resolvedObj.searchParams.has(key)) {
+            resolvedObj.searchParams.set(key, val);
+          }
+        });
+        return resolvedObj.href;
+      } catch (e) {
+        return relativeUrl;
+      }
+    };
+
     // --- 4. HLS (.m3u8) PERFECT PROXY ---
     if (isM3u8) {
       const text = await response.text();
@@ -86,14 +113,14 @@ export async function onRequest(context) {
         if (trimmed.startsWith("#") && trimmed.includes('URI="')) {
           return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
             try {
-              const absoluteUrl = new URL(p1, finalUrl).href;
+              const absoluteUrl = resolveAndKeepParams(p1, finalUrl);
               return `URI="${proxyBase}${encodeURIComponent(absoluteUrl)}"`;
             } catch (e) { return match; }
           });
         }
         if (trimmed && !trimmed.startsWith("#")) {
           try {
-            const absoluteUrl = new URL(trimmed, finalUrl).href;
+            const absoluteUrl = resolveAndKeepParams(trimmed, finalUrl);
             return proxyBase + encodeURIComponent(absoluteUrl);
           } catch (e) { return line; }
         }
@@ -101,7 +128,7 @@ export async function onRequest(context) {
       });
 
       const newHeaders = copyCleanHeaders();
-      newHeaders.set("Content-Type", "application/vnd.apple.mpegurl"); // Force HLS type
+      newHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
 
       return new Response(rewrittenLines.join("\n"), {
         status: response.status,
@@ -110,45 +137,47 @@ export async function onRequest(context) {
       });
     }
 
-    // --- 5. DASH (.mpd) PERFECT PROXY ---
+    // --- 5. DASH (.mpd) DRM PERFECT PROXY ---
     if (isMpd) {
       const text = await response.text();
       let rewrittenText = text;
 
-      // Extract the root BaseURL if it exists (helps resolve nested relative segment URLs)
+      // Strip <Location> tags. If present, players use this to bypass the proxy, breaking CORS!
+      rewrittenText = rewrittenText.replace(/<Location>.*?<\/Location>/g, "");
+
       let dashBaseUrl = finalUrl;
       const baseMatch = text.match(/<BaseURL>(.*?)<\/BaseURL>/);
       if (baseMatch) {
         try {
-          dashBaseUrl = new URL(baseMatch[1].trim(), finalUrl).href;
+          dashBaseUrl = resolveAndKeepParams(baseMatch[1].trim(), finalUrl);
         } catch (e) {}
       }
 
       // Rewrite <BaseURL> tags
       rewrittenText = rewrittenText.replace(/<BaseURL>(.*?)<\/BaseURL>/g, (match, p1) => {
         try {
-          const absoluteUrl = new URL(p1.trim(), finalUrl).href;
-          // Note: We avoid encoding $ symbols so ExoPlayer's $Number$ templates don't break
+          const absoluteUrl = resolveAndKeepParams(p1.trim(), finalUrl);
           const wrapped = proxyBase + encodeURIComponent(absoluteUrl).replace(/%24/g, '$');
           return `<BaseURL>${wrapped}</BaseURL>`;
         } catch (e) { return match; }
       });
 
-      // Rewrite media="", initialization="", and sourceURL=""
-      rewrittenText = rewrittenText.replace(/(media|initialization|sourceURL)="([^"]+)"/g, (match, attr, p2) => {
+      // Rewrite media="", initialization="", sourceURL="", and xlink:href="" safely
+      rewrittenText = rewrittenText.replace(/(media|initialization|sourceURL|xlink:href)="([^"]+)"/g, (match, attr, p2) => {
         try {
-          // If the URL is already absolute inside the manifest, don't use dashBaseUrl
-          const resolveBase = p2.startsWith("http") ? finalUrl : dashBaseUrl;
-          const absoluteUrl = new URL(p2.trim(), resolveBase).href;
+          const cleanP2 = p2.replace(/&amp;/g, '&'); // Clean upstream XML formatting
+          const resolveBase = cleanP2.startsWith("http") ? finalUrl : dashBaseUrl;
           
-          // Revert %24 to $ to ensure ExoPlayer variables like $Number$ and $Time$ work perfectly
+          const absoluteUrl = resolveAndKeepParams(cleanP2.trim(), resolveBase);
+          
+          // Wrap in proxy and restore $ variables for ExoPlayer template loading ($Number$, $Time$)
           const wrapped = proxyBase + encodeURIComponent(absoluteUrl).replace(/%24/g, '$');
           return `${attr}="${wrapped}"`;
         } catch (e) { return match; }
       });
 
       const newHeaders = copyCleanHeaders();
-      newHeaders.set("Content-Type", "application/dash+xml"); // Force DASH MPD type (Fixes raw text bug)
+      newHeaders.set("Content-Type", "application/dash+xml");
 
       return new Response(rewrittenText, {
         status: response.status,
@@ -157,7 +186,7 @@ export async function onRequest(context) {
       });
     }
 
-    // --- 6. Direct Stream Proxy (For .ts, .m4s, keys, etc.) ---
+    // --- 6. Direct Stream Proxy (For .ts, .m4s segments, initialization files, keys) ---
     const proxyHeaders = new Headers(response.headers);
     proxyHeaders.delete("Access-Control-Allow-Origin");
     proxyHeaders.delete("Access-Control-Allow-Methods");
