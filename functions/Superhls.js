@@ -2,24 +2,15 @@
 //
 // HLS / DASH stream proxy for Cloudflare Pages Functions.
 //
-// Two block types are handled:
-//   - Geographic-only (FanCode): cleared by edge placement, no proxy needed.
-//   - Datacenter-refusing (SonyLiv, Hotstar): forwarded through a public
-//     HTTP proxy on an Indian residential/campus network. Those proxies are
-//     strangers' machines — fine for token-signed public streams that expire
-//     in hours, not for anything private.
-//
 //   GET /api/live-proxy?url=<encoded>[&cookie=][&ref=][&ua=][&via=host:port]
 //
-// Constraints this respects:
-//   - workerd has no ProxyAgent. Proxies are addressed directly:
-//     fetch(`http://${proxy}/${target}`). CONNECT-only proxies will fail the
-//     r.ok check and be discarded — test your list before deploying.
-//   - Subrequest budget: 50 free / 10000 paid. MAX_TRIES caps the race.
-//   - CPU budget on free is 10 ms. Segments stream through, never buffered.
-//   - Playlist/DASH base uses upstream.url (post-redirect), not targetUrl.
-//   - Range is forwarded; 206 and Content-Range pass through.
-//   - No env, no wrangler.toml, no dashboard config required.
+// workerd constraints respected:
+//   - No ProxyAgent. Proxies addressed directly: fetch(`${scheme}://${proxy}/${url}`)
+//     for scheme in {http, https}. CONNECT-only proxies still won't work.
+//   - Subrequest budget 50 free / 10000 paid. MAX_TRIES caps the race.
+//   - CPU budget 10 ms free. Segments stream, never buffered.
+//   - Playlist base uses upstream.url (post-redirect), not targetUrl.
+//   - Range forwarded; 206 + Content-Range pass through.
 
 const ALLOWED = ['fancode.com', 'akamaized.net', 'hotstar.com', 'jio.com'];
 
@@ -29,14 +20,33 @@ const NEEDS_RESIDENTIAL = [
   'hotstar.com',
 ];
 
-const PROXY_LIST =
-  'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt';
+// What each CDN's WAF actually expects. Defaulting to the CDN's own origin
+// (which the previous version did) is what earns the Akamai error page:
+// sonydaimenew.akamaized.net does not refer itself.
+const REFERERS = [
+  [/hotstar\.com$/i,                    'https://www.hotstar.com/'],
+  [/sonydaimenew\.akamaized\.net$/i,    'https://www.sonyliv.com/'],
+  [/sonyliv\.com$/i,                    'https://www.sonyliv.com/'],
+  [/fancode\.com$/i,                    'https://www.fancode.com/'],
+  [/jio\.com$/i,                        'https://www.jio.com/'],
+];
+
+function refererFor(hostname) {
+  for (const [re, ref] of REFERERS) if (re.test(hostname)) return ref;
+  return null;
+}
+
+const PROXY_LIST_URLS = [
+  'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt',
+  'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/https.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+];
 
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-// Subrequest budget leaves headroom for the list fetch, the pinned attempt,
-// and the direct fallback.
+// Leave headroom for the list fetch, the pinned attempt, and the direct
+// fallback. 30 tries at 8-wide is 4 batches worst case.
 const MAX_TRIES = 30;
 const BATCH = 8;
 const BATCH_MS = 5000;
@@ -48,10 +58,10 @@ const needsResidential = (h) => NEEDS_RESIDENTIAL.some(s => h === s || h.endsWit
 
 // ── proxy pool ──────────────────────────────────────────────
 // Module scope survives between requests on a warm isolate. `inflight`
-// guards against a cold isolate stampeding the list URL.
+// guards against a cold isolate stampeding every list at once.
 let pool = { list: [], at: 0 };
 let inflight = null;
-const known = new Map();  // hostname -> proxy that last worked for it
+const known = new Map();  // hostname -> { scheme, proxy } that last worked
 
 function capKnown() {
   if (known.size > 500) known.delete(known.keys().next().value);
@@ -61,24 +71,29 @@ async function proxyList() {
   if (pool.list.length && Date.now() - pool.at < 15 * 60_000) return pool.list;
   if (inflight) return inflight;
   inflight = (async () => {
-    try {
-      const r = await fetch(PROXY_LIST, { cf: { cacheTtl: 900 } });
-      if (r.ok) {
+    const merged = new Set();
+    await Promise.all(PROXY_LIST_URLS.map(async (src) => {
+      try {
+        const r = await fetch(src, { cf: { cacheTtl: 900 } });
+        if (!r.ok) return;
         const txt = await r.text();
-        const list = txt.split('\n').map(l => l.trim())
-          .filter(l => /^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(l));
-        if (list.length) pool = { list, at: Date.now() };
-      }
-    } catch { /* keep whatever we had */ }
-    finally { inflight = null; }
-  })();
+        for (const line of txt.split('\n')) {
+          const t = line.trim();
+          if (/^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(t)) merged.add(t);
+        }
+      } catch { /* skip this source */ }
+    }));
+    const list = [...merged];
+    if (list.length) pool = { list, at: Date.now() };
+  })().finally(() => { inflight = null; });
   return inflight;
 }
 
-// Direct-address proxy fetch. workerd has no ProxyAgent; the proxy is the
-// host in the URL and the target goes in the path.
-function get(url, headers, proxy, ms) {
-  const target = proxy ? `http://${proxy}/${url}` : url;
+// Direct-address proxy fetch. workerd has no ProxyAgent, so the proxy goes
+// in the URL and the target goes in the path. Both schemes are tried: some
+// entries only answer TLS on the advertised port.
+function get(url, headers, proxy, ms, scheme = 'http') {
+  const target = proxy ? `${scheme}://${proxy}/${url}` : url;
   return fetch(target, {
     headers,
     signal: AbortSignal.timeout(ms),
@@ -91,30 +106,38 @@ function get(url, headers, proxy, ms) {
 // what SonyLiv accepts and what Hotstar accepts need not match.
 async function findProxy(url, headers, hostname, skip = '') {
   const list = await proxyList();
-  if (!list.length) return null;
+  if (!list.length) return { hit: null, diag: 'empty-pool' };
 
   const remembered = known.get(hostname);
-  const rest = list.filter(p => p !== remembered && p !== skip);
-  const ordered = remembered && remembered !== skip ? [remembered, ...rest] : rest;
+  const rememberedKey = remembered ? remembered.proxy : '';
+  const rest = list.filter(p => p !== rememberedKey && p !== skip);
+  const ordered = rememberedKey && rememberedKey !== skip
+    ? [rememberedKey, ...rest]
+    : rest;
 
+  const failures = [];
   for (let i = 0; i < Math.min(ordered.length, MAX_TRIES); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH);
-    const hit = await Promise.any(batch.map(async (p) => {
-      const r = await get(url, headers, p, BATCH_MS);
-      if (!r.ok) throw new Error(String(r.status));
-      return { proxy: p, res: r };
-    })).catch((agg) => {
-      // Surface the last batch's failures so a dead pool is visible.
-      if (i + BATCH >= Math.min(ordered.length, MAX_TRIES)) {
-        const codes = (agg && agg.errors ? agg.errors : [])
-          .map(e => e && e.message).filter(Boolean).slice(0, 8);
-        console.warn('proxy race exhausted', hostname, codes);
+
+    const attempts = batch.flatMap((p) => ['http', 'https'].map(async (scheme) => {
+      try {
+        const r = await get(url, headers, p, BATCH_MS, scheme);
+        if (!r.ok) throw new Error(`${r.status}`);
+        return { proxy: p, scheme, res: r };
+      } catch (e) {
+        failures.push(`${p}/${scheme}=${e.message}`);
+        throw e;
       }
-      return null;
-    });
-    if (hit) { known.set(hostname, hit.proxy); capKnown(); return hit; }
+    }));
+
+    const hit = await Promise.any(attempts).catch(() => null);
+    if (hit) {
+      known.set(hostname, { proxy: hit.proxy, scheme: hit.scheme });
+      capKnown();
+      return { hit, diag: `ok ${hit.proxy} via ${hit.scheme}` };
+    }
   }
-  return null;
+  return { hit: null, diag: failures.slice(-12).join(',') };
 }
 
 // ── handler ─────────────────────────────────────────────────
@@ -122,7 +145,8 @@ const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
   'Access-Control-Allow-Headers': '*',
-  'Access-Control-Expose-Headers': 'X-Proxy-Via, X-Proxy-Upstream',
+  'Access-Control-Expose-Headers':
+    'X-Proxy-Via, X-Proxy-Scheme, X-Proxy-Diag, X-Proxy-Upstream',
 };
 
 export const onRequestOptions = async () =>
@@ -134,7 +158,7 @@ export const onRequestGet = async (context) => {
 
   const target = url.searchParams.get('url');
   const cookie = url.searchParams.get('cookie') || '';
-  const ref = url.searchParams.get('ref') || '';
+  const refParam = url.searchParams.get('ref') || '';
   const ua = url.searchParams.get('ua') || '';
   const via = url.searchParams.get('via') || '';
 
@@ -146,14 +170,22 @@ export const onRequestGet = async (context) => {
   if (!allowed(targetUrl.hostname))
     return new Response('Host not allowed', { status: 403, headers: CORS });
 
-  let refOrigin = targetUrl.origin;
-  if (ref) { try { refOrigin = new URL(ref).origin; } catch { /* keep target's */ } }
+  // Referer priority: explicit ?ref= wins; otherwise the CDN's expected
+  // origin from REFERERS; otherwise the target's own origin as a last resort.
+  const referer =
+    refParam ||
+    refererFor(targetUrl.hostname) ||
+    targetUrl.origin + '/';
+  let refOrigin;
+  try { refOrigin = new URL(referer).origin; }
+  catch { refOrigin = targetUrl.origin; }
 
   const headers = {
     'User-Agent': ua || DEFAULT_UA,
-    'Referer': ref || targetUrl.origin + '/',
+    'Referer': referer,
     'Origin': refOrigin,
     'Accept': '*/*',
+    'Accept-Language': 'en-IN,en;q=0.9',
     ...(cookie ? { Cookie: cookie } : {}),
     ...(request.headers.get('range')
       ? { Range: request.headers.get('range') }
@@ -162,41 +194,54 @@ export const onRequestGet = async (context) => {
 
   let upstream = null;
   let usedProxy = '';
+  let usedScheme = '';
+  let diag = '';
 
   try {
     if (via) {
-      // A playlist names the proxy that fetched it, so its segments go the
-      // same way instead of each one searching the pool again. Public
+      // A playlist names the proxy that fetched it, so its segments follow
+      // the same route instead of each one searching the pool again. Public
       // proxies die mid-stream, so a pinned one that throws or refuses is
       // dropped and the pool is searched again.
-      const pinned = known.get(targetUrl.hostname) || via;
+      const remembered = known.get(targetUrl.hostname);
+      const pinned = remembered ? remembered.proxy : via;
+      const pinnedScheme = remembered ? remembered.scheme : 'http';
       usedProxy = pinned;
-      try { upstream = await get(targetUrl.toString(), headers, pinned, PINNED_MS); }
+      usedScheme = pinnedScheme;
+
+      try { upstream = await get(targetUrl.toString(), headers, pinned, PINNED_MS, pinnedScheme); }
       catch { upstream = null; }
 
       if (!upstream || !upstream.ok) {
-        if (known.get(targetUrl.hostname) === pinned) known.delete(targetUrl.hostname);
-        const hit = await findProxy(targetUrl.toString(), headers, targetUrl.hostname, pinned);
-        if (hit) { upstream = hit.res; usedProxy = hit.proxy; }
-        else {
+        const prevStatus = upstream ? upstream.status : 0;
+        if (remembered && remembered.proxy === pinned) known.delete(targetUrl.hostname);
+        const found = await findProxy(targetUrl.toString(), headers, targetUrl.hostname, pinned);
+        if (found.hit) {
+          upstream = found.hit.res;
+          usedProxy = found.hit.proxy;
+          usedScheme = found.hit.scheme;
+          diag = found.diag;
+        } else {
           // Pinned failed and the pool is empty or dead. Try direct before
           // giving up, so the player sees a slower fetch rather than a 403.
-          const status = upstream ? upstream.status : 0;
           upstream = await get(targetUrl.toString(), headers, null, DIRECT_MS);
           usedProxy = '';
-          if (!upstream.ok && status) {
-            console.warn('pinned + pool + direct all failed',
-              targetUrl.hostname, status, upstream.status);
-          }
+          usedScheme = '';
+          diag = `pinned ${prevStatus} then ${found.diag}`;
         }
       }
     } else if (needsResidential(targetUrl.hostname)) {
-      const hit = await findProxy(targetUrl.toString(), headers, targetUrl.hostname);
-      if (hit) { upstream = hit.res; usedProxy = hit.proxy; }
-      else upstream = await get(targetUrl.toString(), headers, null, DIRECT_MS);
+      const found = await findProxy(targetUrl.toString(), headers, targetUrl.hostname);
+      if (found.hit) {
+        upstream = found.hit.res;
+        usedProxy = found.hit.proxy;
+        usedScheme = found.hit.scheme;
+        diag = found.diag;
+      } else {
+        upstream = await get(targetUrl.toString(), headers, null, DIRECT_MS);
+        diag = found.diag;
+      }
     } else {
-      // FanCode and friends: served straight from the edge. Placement is
-      // what clears their geographic block, not a proxy.
       upstream = await get(targetUrl.toString(), headers, null, DIRECT_MS);
     }
   } catch (e) {
@@ -204,15 +249,27 @@ export const onRequestGet = async (context) => {
   }
 
   const out = new Headers(CORS);
-  if (usedProxy) out.set('X-Proxy-Via', usedProxy);
+  if (usedProxy) {
+    out.set('X-Proxy-Via', usedProxy);
+    out.set('X-Proxy-Scheme', usedScheme);
+  }
+  if (diag) out.set('X-Proxy-Diag', diag.slice(0, 500));
 
-  // A refusal is not a playlist, whatever the path says. Rewriting an HTML
-  // error page as one turns its lines into proxy URLs and the player gets a
-  // 200-looking manifest of nonsense instead of the reason.
   if (!upstream.ok) {
     const body = await upstream.text();
     out.set('X-Proxy-Upstream', String(upstream.status));
-    return new Response(body.slice(0, 2000), { status: upstream.status, headers: out });
+
+    // Akamai puts its real reason in these headers when it serves the
+    // edgesuite error page. Pass them through so curl shows what the code
+    // cannot see.
+    for (const h of ['x-akamai-request-id', 'x-akamai-transformed',
+                     'server-timing', 'x-cache', 'x-check-cacheable',
+                     'x-true-cache-key']) {
+      const v = upstream.headers.get(h);
+      if (v) out.set('X-Upstream-' + h, v.slice(0, 300));
+    }
+
+    return new Response(body.slice(0, 4000), { status: upstream.status, headers: out });
   }
 
   // Redirects change the directory; relative playlist lines must resolve
@@ -224,11 +281,6 @@ export const onRequestGet = async (context) => {
   const isPlaylist = lower.endsWith('.m3u8') || ct.includes('mpegurl');
   const isDash = lower.endsWith('.mpd') || ct.includes('dash+xml');
 
-  // ── DASH manifest ─────────────────────────────────────────
-  // Segment names live in templates, not as URLs, so line-by-line rewriting
-  // does not apply. An absolute BaseURL pointing at the real directory makes
-  // the player resolve segments to real CDN URLs, which the client-side
-  // request filter then wraps on the way out.
   if (isDash) {
     let xml = await upstream.text();
     const dir = resolvedBase.href.slice(0, resolvedBase.href.lastIndexOf('/') + 1);
@@ -240,14 +292,13 @@ export const onRequestGet = async (context) => {
     return new Response(xml, { status: 200, headers: out });
   }
 
-  // ── HLS playlist ──────────────────────────────────────────
   if (isPlaylist) {
     const text = await upstream.text();
     const base = `${url.origin}/api/live-proxy`;
 
     const extras =
       (cookie ? '&cookie=' + encodeURIComponent(cookie) : '') +
-      (ref ? '&ref=' + encodeURIComponent(ref) : '') +
+      (refParam ? '&ref=' + encodeURIComponent(refParam) : '') +
       (ua ? '&ua=' + encodeURIComponent(ua) : '') +
       (usedProxy ? '&via=' + encodeURIComponent(usedProxy) : '');
 
@@ -276,9 +327,6 @@ export const onRequestGet = async (context) => {
     return new Response(body, { status: 200, headers: out });
   }
 
-  // ── Segments and keys ─────────────────────────────────────
-  // Stream through. No Buffer, no arrayBuffer — workerd's CPU budget on the
-  // free plan is 10 ms and materializing a 6 MB segment eats it.
   out.set('Content-Type', ct || 'application/octet-stream');
   out.set('Cache-Control', upstream.headers.get('cache-control') || 'no-cache');
   const cr = upstream.headers.get('content-range');
